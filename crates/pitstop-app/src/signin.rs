@@ -223,6 +223,7 @@ fn watch(
     let result = outcome.and_then(|login| {
         let state = app.state::<AppState>();
         let _op = state.ops.lock();
+        let _account_guard = crate::t3_bridge::lock().map_err(|e| UiError::new("io", e))?;
         let engine = app::engine();
         let parked = if again {
             engine

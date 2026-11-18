@@ -42,6 +42,7 @@ pub struct Snapshot {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Automation {
+    pub auto_switch_codex: bool,
     pub auto_switch: bool,
     pub auto_switch_at: u8,
     pub use_first: crate::duty::UseFirst,
@@ -49,13 +50,14 @@ pub struct Automation {
     pub notify_near: bool,
     pub warm_from: String,
     pub warm_to: String,
-    /// One per Claude Code account.
+    /// One per Claude Code or Codex account.
     pub warm_up: Vec<WarmRow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WarmRow {
+    pub provider: ProviderId,
     pub name: String,
     pub plan: Option<String>,
     pub on: bool,
@@ -68,6 +70,7 @@ pub struct WarmRow {
 /// What the last round of duties judged of one account's warm-up.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WarmState {
+    pub provider: ProviderId,
     pub name: String,
     pub standing: crate::duty::WarmStanding,
     pub warmed_at: Option<i64>,
@@ -96,6 +99,9 @@ pub enum LiveView {
     Unmanaged {
         label: Option<String>,
         plan: Option<String>,
+        /// The account the login's own record names, where its token was
+        /// found to be someone else's: signing in again in the tool mends it.
+        recorded: Option<String>,
     },
     /// The login could not be read.
     Unknown { message: String },
@@ -230,6 +236,7 @@ pub fn build<H: Host>(engine: &Engine<H>, input: &Input) -> Snapshot {
         version: env!("CARGO_PKG_VERSION"),
         automation: Automation {
             auto_switch: input.settings.auto_switch,
+            auto_switch_codex: input.settings.auto_switch_codex,
             auto_switch_at: input.settings.auto_switch_at,
             use_first: input.settings.use_first,
             notify_run_out: input.settings.notify_run_out,
@@ -271,7 +278,15 @@ pub fn build<H: Host>(engine: &Engine<H>, input: &Input) -> Snapshot {
             let live = match live {
                 Ok(Live::LoggedOut) => LiveView::LoggedOut,
                 Ok(Live::Account(name)) => LiveView::Account { name },
-                Ok(Live::Unmanaged { label, plan }) => LiveView::Unmanaged { label, plan },
+                Ok(Live::Unmanaged {
+                    label,
+                    plan,
+                    recorded,
+                }) => LiveView::Unmanaged {
+                    label,
+                    plan,
+                    recorded,
+                },
                 Err(e) => LiveView::Unknown {
                     message: e.to_string(),
                 },
@@ -328,12 +343,17 @@ pub fn build<H: Host>(engine: &Engine<H>, input: &Input) -> Snapshot {
     snapshot.automation.warm_up = snapshot
         .tools
         .iter()
-        .filter(|t| t.id == ProviderId::ClaudeCode.as_str())
-        .flat_map(|t| &t.accounts)
-        .map(|a| {
-            let on = input.settings.warm_up.contains(&a.name);
-            let judged = input.warm.iter().find(|w| w.name == a.name);
+        .filter(|t| matches!(t.id, "claude-code" | "codex"))
+        .flat_map(|t| t.accounts.iter().map(move |a| (t, a)))
+        .map(|(t, a)| {
+            let provider = ProviderId::parse(t.id).expect("filtered provider");
+            let on = input.settings.warm_accounts(provider).contains(&a.name);
+            let judged = input
+                .warm
+                .iter()
+                .find(|w| w.provider == provider && w.name == a.name);
             WarmRow {
+                provider,
                 name: a.name.clone(),
                 plan: a.plan.clone(),
                 on,
@@ -496,13 +516,25 @@ pub fn menu(snapshot: &Snapshot, lang: Lang, clock: &dyn Fn(i64) -> String) -> V
                 lines.push(MenuLine::Note(line));
             }
         }
-        if let LiveView::Unmanaged { label, .. } = &tool.live {
+        if let LiveView::Unmanaged {
+            label, recorded, ..
+        } = &tool.live
+        {
+            // A login whose record names someone else can't be named: the
+            // window says how to mend it.
+            let id = match recorded {
+                Some(_) => "open".into(),
+                None => format!("name|{}", tool.id),
+            };
             lines.push(MenuLine::Account {
-                id: format!("name|{}", tool.id),
+                id,
                 title: label.clone().unwrap_or_else(|| lang.unknown_login().into()),
                 checked: true,
             });
-            lines.push(MenuLine::Note(lang.not_named_yet().into()));
+            lines.push(MenuLine::Note(match recorded {
+                Some(_) => lang.sign_in_again_in_tool().into(),
+                None => lang.not_named_yet().into(),
+            }));
         }
     }
 
@@ -745,7 +777,8 @@ mod tests {
             claude(&snapshot).live,
             LiveView::Unmanaged {
                 label: Some("c@x.com".into()),
-                plan: Some("Max 20x".into())
+                plan: Some("Max 20x".into()),
+                recorded: None,
             }
         );
     }
@@ -970,6 +1003,77 @@ mod tests {
             })
             .expect("the unmanaged login is listed");
         assert_eq!(lines[at + 1], MenuLine::Note("Not named yet".into()));
+    }
+
+    /// Anthropic, saying every Claude Code token is c@x.com's.
+    struct AllTokensAreCs;
+
+    impl pitstop_core::usage::UsageApi for AllTokensAreCs {
+        fn claude_profile(
+            &self,
+            _: &str,
+        ) -> Result<serde_json::Value, pitstop_core::usage::FetchError> {
+            Ok(serde_json::json!({
+                "account": {"uuid": "uuid-c@x.com", "email": "c@x.com"},
+                "organization": {"uuid": "org"}
+            }))
+        }
+        fn claude(&self, _: &str) -> Result<serde_json::Value, pitstop_core::usage::FetchError> {
+            unreachable!()
+        }
+        fn codex(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<serde_json::Value, pitstop_core::usage::FetchError> {
+            unreachable!()
+        }
+        fn cursor(&self, _: &str) -> Result<serde_json::Value, pitstop_core::usage::FetchError> {
+            unreachable!()
+        }
+        fn renew_claude(
+            &self,
+            _: &pitstop_core::usage::ClaudeRenewal,
+        ) -> Result<serde_json::Value, pitstop_core::usage::FetchError> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn a_token_whose_record_names_someone_else_is_nobodys_in_use_and_asks_for_login() {
+        let engine = work_and_personal();
+        // a new token, with work's record left in place
+        let creds = r#"{"claudeAiOauth":{"accessToken":"SECRET-TOKEN-CCC","subscriptionType":"team","rateLimitTier":"default_claude_max_5x"}}"#;
+        engine
+            .host()
+            .put_file(ClaudeCode::credentials_path(engine.host()), creds);
+        engine.check_live(&AllTokensAreCs);
+
+        let snapshot = snapshot_of(&engine, &[]);
+        assert_eq!(
+            claude(&snapshot).live,
+            LiveView::Unmanaged {
+                label: Some("c@x.com".into()),
+                plan: Some("Team 5x".into()),
+                recorded: Some("a@x.com".into()),
+            }
+        );
+        assert!(in_use(&snapshot).is_empty());
+        let lines = menu(&snapshot, Lang::En, &clock);
+        let at = lines
+            .iter()
+            .position(|l| {
+                *l == MenuLine::Account {
+                    id: "open".into(),
+                    title: "c@x.com".into(),
+                    checked: true,
+                }
+            })
+            .expect("the login is listed, opening the window rather than naming");
+        assert_eq!(
+            lines[at + 1],
+            MenuLine::Note("Its record names another account: run /login".into())
+        );
     }
 
     #[test]

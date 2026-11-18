@@ -250,9 +250,16 @@ fn run_in(
     token: Option<&str>,
     search: &[PathBuf],
 ) -> Result<(), Failure> {
-    let mut child = command(program, dir, token, search)
+    run_command(command(program, dir, token, search), verdict)
+}
+
+pub(crate) fn run_command(
+    mut command: Command,
+    verdict: fn(Option<i32>, &str) -> Result<(), Failure>,
+) -> Result<(), Failure> {
+    let mut child = command
         .spawn()
-        .map_err(|e| Failure::Failed(format!("couldn't start Claude Code: {e}")))?;
+        .map_err(|e| Failure::Failed(format!("couldn't start warm-up: {e}")))?;
     let mut stdout = child.stdout.take();
     let (said_tx, said_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -296,6 +303,15 @@ fn run_in(
 /// Every read-modify-write of `warmed.json` in this process holds this, so a
 /// rename or a forget never interleaves with writing down a warm-up.
 static LEDGER: Mutex<()> = Mutex::new(());
+
+/// Old Claude ledger keys stay compatible; account names cannot contain `/`.
+pub fn key(provider: ProviderId, name: &str) -> String {
+    if provider == ProviderId::Codex {
+        format!("codex/{name}")
+    } else {
+        name.to_owned()
+    }
+}
 
 /// Every account's [`Warmed`], by name, in `~/.pitstop/warmed.json`.
 pub type Ledger = BTreeMap<String, Warmed>;
@@ -422,19 +438,19 @@ pub fn forget(host: &dyn Host, name: &str) {
 
 /// What a Claude Code account's rename carries: its warm-up setting and its
 /// record both move to the new name.
-pub fn follow_rename(host: &dyn Host, old: &str, new: &str) {
+pub fn follow_rename(host: &dyn Host, provider: ProviderId, old: &str, new: &str) {
     let mut saved = crate::settings::load(host);
-    saved.rename_account(old, new);
+    saved.rename_account(provider, old, new);
     let _ = crate::settings::save(host, &saved);
-    rename(host, old, new);
+    rename(host, &key(provider, old), &key(provider, new));
 }
 
 /// What forgetting a Claude Code account takes with it.
-pub fn follow_forget(host: &dyn Host, name: &str) {
+pub fn follow_forget(host: &dyn Host, provider: ProviderId, name: &str) {
     let mut saved = crate::settings::load(host);
-    saved.forget_account(name);
+    saved.forget_account(provider, name);
     let _ = crate::settings::save(host, &saved);
-    forget(host, name);
+    forget(host, &key(provider, name));
 }
 
 #[cfg(test)]
@@ -684,6 +700,37 @@ mod tests {
     }
 
     #[test]
+    fn codex_and_claude_with_the_same_name_keep_independent_settings_and_records() {
+        let host = pitstop_core::testing::FakeHost::new();
+        crate::settings::save(
+            &host,
+            &crate::settings::Settings {
+                warm_up: vec!["same".into()],
+                codex_warm_up: vec!["same".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut ledger = Ledger::new();
+        record(&mut ledger, "same", "2026-11-05", 7, Ok(()));
+        record(
+            &mut ledger,
+            &key(ProviderId::Codex, "same"),
+            "2026-11-05",
+            9,
+            Ok(()),
+        );
+        save(&host, &ledger);
+        follow_rename(&host, ProviderId::Codex, "same", "other");
+        let settings = crate::settings::load(&host);
+        assert_eq!(settings.warm_up, ["same"]);
+        assert_eq!(settings.codex_warm_up, ["other"]);
+        follow_forget(&host, ProviderId::Codex, "other");
+        assert_eq!(load(&host, "2026-11-05").len(), 1);
+        assert_eq!(load(&host, "2026-11-05")["same"].started, Some(7));
+    }
+
+    #[test]
     fn a_rename_and_a_forget_carry_the_setting_and_the_record() {
         let host = pitstop_core::testing::FakeHost::new();
         let settings = crate::settings::Settings {
@@ -695,14 +742,14 @@ mod tests {
         record(&mut ledger, "old", "2026-10-15", 7, Ok(()));
         save(&host, &ledger);
 
-        follow_rename(&host, "old", "new");
+        follow_rename(&host, ProviderId::ClaudeCode, "old", "new");
         assert_eq!(
             crate::settings::load(&host).warm_up,
             vec!["new".to_string(), "other".to_string()]
         );
         assert_eq!(load(&host, "2026-10-15")["new"].started, Some(7));
 
-        follow_forget(&host, "new");
+        follow_forget(&host, ProviderId::ClaudeCode, "new");
         assert_eq!(
             crate::settings::load(&host).warm_up,
             vec!["other".to_string()]

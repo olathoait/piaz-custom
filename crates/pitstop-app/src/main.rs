@@ -5,6 +5,8 @@
 
 mod app;
 mod cli;
+mod codex_reset;
+mod codex_warm;
 mod commands;
 mod duty;
 mod i18n;
@@ -16,6 +18,7 @@ mod renew;
 mod settings;
 mod signin;
 mod spend;
+mod t3_bridge;
 mod toast;
 mod tray;
 mod tray_look;
@@ -70,6 +73,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::get_snapshot,
             commands::refresh,
+            commands::get_limit_resets,
+            commands::use_limit_reset,
             commands::use_account,
             commands::name_account,
             commands::rename_account,

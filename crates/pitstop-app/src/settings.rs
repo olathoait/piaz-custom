@@ -19,6 +19,8 @@ pub struct Settings {
     /// Switch Claude Code by itself once a limit of the account in use
     /// reaches `auto_switch_at` percent.
     pub auto_switch: bool,
+    /// Codex swaps the login file; running providers still need to reload it.
+    pub auto_switch_codex: bool,
     pub auto_switch_at: u8,
     /// Which account the automatic switch, and the offer once one runs out,
     /// goes to first; resets soonest also switches before the threshold.
@@ -31,6 +33,7 @@ pub struct Settings {
     /// Claude Code accounts, by name, whose next five-hour period is started
     /// as soon as the last one ends.
     pub warm_up: Vec<String>,
+    pub codex_warm_up: Vec<String>,
     /// The span of the day warm-ups are made in, `HH:MM` local time; a span
     /// whose start is later than its end runs past midnight.
     pub warm_from: String,
@@ -48,11 +51,13 @@ impl Default for Settings {
             theme: None,
             dismissed_tips: Vec::new(),
             auto_switch: false,
+            auto_switch_codex: false,
             auto_switch_at: 90,
             use_first: crate::duty::UseFirst::MostLeft,
             notify_run_out: true,
             notify_near: true,
             warm_up: Vec::new(),
+            codex_warm_up: Vec::new(),
             warm_from: "07:00".into(),
             warm_to: "23:00".into(),
             check_updates: true,
@@ -62,17 +67,33 @@ impl Default for Settings {
 }
 
 impl Settings {
+    pub fn warm_accounts(&self, provider: pitstop_core::ProviderId) -> &[String] {
+        if provider == pitstop_core::ProviderId::Codex {
+            &self.codex_warm_up
+        } else {
+            &self.warm_up
+        }
+    }
+
+    pub fn warm_accounts_mut(&mut self, provider: pitstop_core::ProviderId) -> &mut Vec<String> {
+        if provider == pitstop_core::ProviderId::Codex {
+            &mut self.codex_warm_up
+        } else {
+            &mut self.warm_up
+        }
+    }
+
     /// Settings kept by account name follow it to its new name.
-    pub fn rename_account(&mut self, old: &str, new: &str) {
-        for name in &mut self.warm_up {
+    pub fn rename_account(&mut self, provider: pitstop_core::ProviderId, old: &str, new: &str) {
+        for name in self.warm_accounts_mut(provider) {
             if name == old {
                 new.clone_into(name);
             }
         }
     }
 
-    pub fn forget_account(&mut self, name: &str) {
-        self.warm_up.retain(|n| n != name);
+    pub fn forget_account(&mut self, provider: pitstop_core::ProviderId, name: &str) {
+        self.warm_accounts_mut(provider).retain(|n| n != name);
     }
 }
 
@@ -105,6 +126,8 @@ mod tests {
         assert_eq!(settings.language.as_deref(), Some("vi"));
         assert_eq!(settings.dismissed_tips, vec!["codex".to_string()]);
         assert!(!settings.auto_switch);
+        assert!(!settings.auto_switch_codex);
+        assert!(settings.codex_warm_up.is_empty());
         assert_eq!(settings.auto_switch_at, 90);
         assert_eq!(settings.use_first, crate::duty::UseFirst::MostLeft);
         assert!(settings.notify_run_out);
@@ -121,6 +144,8 @@ mod tests {
         let settings = Settings {
             auto_switch: true,
             auto_switch_at: 80,
+            auto_switch_codex: true,
+            codex_warm_up: vec!["codex-one".into()],
             use_first: crate::duty::UseFirst::ResetsSoonest,
             notify_run_out: false,
             notify_near: false,
@@ -139,12 +164,12 @@ mod tests {
             warm_up: vec!["ben1".into(), "ben2".into()],
             ..Settings::default()
         };
-        settings.rename_account("ben2", "work");
+        settings.rename_account(pitstop_core::ProviderId::ClaudeCode, "ben2", "work");
         assert_eq!(
             settings.warm_up,
             vec!["ben1".to_string(), "work".to_string()]
         );
-        settings.forget_account("ben1");
+        settings.forget_account(pitstop_core::ProviderId::ClaudeCode, "ben1");
         assert_eq!(settings.warm_up, vec!["work".to_string()]);
     }
 }

@@ -321,6 +321,7 @@ mod tests {
             version: "0",
             automation: crate::model::Automation {
                 auto_switch: false,
+                auto_switch_codex: false,
                 auto_switch_at: 90,
                 use_first: crate::duty::UseFirst::MostLeft,
                 notify_run_out: true,

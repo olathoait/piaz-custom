@@ -114,6 +114,9 @@ fn changed(app: &AppHandle) {
 
 /// Whether this copy can put a new version in its own place.
 fn can_install() -> bool {
+    if !can_replace_with_upstream(env!("CARGO_PKG_VERSION")) {
+        return false;
+    }
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
@@ -131,6 +134,11 @@ fn can_install() -> bool {
     } else {
         false
     }
+}
+
+fn can_replace_with_upstream(version: &str) -> bool {
+    // Upstream bundles omit Codex automation and the running T3 bridge's commands.
+    !version.contains("+codex.")
 }
 
 /// Ask the release whether a newer version is out, and keep the answer.
@@ -239,6 +247,12 @@ pub async fn set_check_updates(app: AppHandle, on: bool) -> Result<(), UiError> 
 /// over and starts the new version itself; this call never returns there.
 #[tauri::command]
 pub async fn install_update(app: AppHandle) -> Result<(), UiError> {
+    if !can_replace_with_upstream(env!("CARGO_PKG_VERSION")) {
+        return Err(UiError::new(
+            "updateCustom",
+            "This custom build needs its Codex changes merged before updating. An upstream bundle would remove them.",
+        ));
+    }
     if !can_install() {
         // The setup would install a second copy beside a portable one.
         return Err(UiError::new(
@@ -338,4 +352,16 @@ pub fn open_releases(app: AppHandle) -> Result<(), UiError> {
     app.opener()
         .open_url(RELEASES, None::<&str>)
         .map_err(|e| UiError::new("open", e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_updates_cannot_replace_custom_builds() {
+        assert!(!can_replace_with_upstream("0.6.0+codex.2"));
+        assert!(!can_replace_with_upstream("0.6.1+codex.3"));
+        assert!(can_replace_with_upstream("0.6.1"));
+    }
 }

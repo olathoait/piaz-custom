@@ -6,3 +6,4 @@
 crates/pitstop-app/gen/
 
 node_modules/
+__pycache__/

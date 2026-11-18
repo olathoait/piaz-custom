@@ -6,6 +6,7 @@ use pitstop_core::activity::{self, verb, By, Entry};
 use pitstop_core::doctor::{self, Check, Level};
 use pitstop_core::engine::{RemoveOutcome, SwitchOutcome};
 use pitstop_core::live::Live;
+use pitstop_core::usage::Http;
 use pitstop_core::{editor, signin, ProviderId};
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
@@ -32,6 +33,75 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) 
 #[tauri::command]
 pub async fn get_snapshot(app: AppHandle) -> Option<Snapshot> {
     blocking(move || app::snapshot(&app)).await
+}
+
+#[tauri::command]
+pub async fn get_limit_resets(
+    app: AppHandle,
+    provider: String,
+    name: String,
+) -> Answer<pitstop_core::limit_reset::Status> {
+    let pid = self::provider(&provider)?;
+    blocking(move || {
+        let state = app.state::<AppState>();
+        let _op = state.ops.lock();
+        match pid {
+            ProviderId::ClaudeCode => app::engine()
+                .limit_resets(&name, &Http::new())
+                .map_err(|e| UiError::from(&e)),
+            ProviderId::Codex => {
+                let _held = crate::t3_bridge::lock().map_err(|e| UiError::new("invalidData", e))?;
+                crate::codex_reset::read(&name).map_err(|e| UiError::new("invalidData", e))
+            }
+            _ => Err(UiError::new(
+                "invalidData",
+                "This provider does not support limit resets",
+            )),
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn use_limit_reset(
+    app: AppHandle,
+    provider: String,
+    name: String,
+    identity: String,
+    grant: String,
+    request: String,
+) -> Answer<()> {
+    let pid = self::provider(&provider)?;
+    blocking(move || {
+        let result = {
+            let state = app.state::<AppState>();
+            let _op = state.ops.lock();
+            match pid {
+                ProviderId::ClaudeCode => {
+                    app::engine().use_limit_reset(&name, &identity, &grant, &request, &Http::new())
+                }
+                ProviderId::Codex => crate::t3_bridge::lock()
+                    .and_then(|_held| {
+                        crate::codex_reset::redeem(&name, &identity, &grant, &request)
+                    })
+                    .map_err(pitstop_core::Error::InvalidData),
+                _ => Err(pitstop_core::Error::InvalidData(
+                    "This provider does not support limit resets".into(),
+                )),
+            }
+        };
+        app::log(
+            &app::host(),
+            Entry::new(app::now(), verb::LIMIT_RESET, By::App)
+                .provider(pid)
+                .account(&name)
+                .outcome(&result),
+        );
+        app::refresh(&app);
+        app::read_usage_now(&app);
+        result.map_err(|e| UiError::from(&e))
+    })
+    .await
 }
 
 /// Read the accounts again; with `usage`, ask for usage too.
@@ -86,12 +156,28 @@ pub fn switch(
     replace_unmanaged: bool,
     restart_editor: bool,
 ) -> Answer<Switched> {
+    switch_expected(app, pid, name, replace_unmanaged, restart_editor, None)
+}
+
+pub fn switch_expected(
+    app: &AppHandle,
+    pid: ProviderId,
+    name: &str,
+    replace_unmanaged: bool,
+    restart_editor: bool,
+    expected_from: Option<&str>,
+) -> Answer<Switched> {
     if app::warming(app, pid, name) {
         return Err(UiError {
             code: "warmingUp",
             message: format!("{name} is warming up; switch when it ends"),
             name: Some(name.to_owned()),
         });
+    }
+    // Whose token Claude Code holds decides where the switch parks it: asked
+    // only when the token changed since the last read asked.
+    if pid == ProviderId::ClaudeCode {
+        app::engine().check_live(&Http::brief());
     }
     let unchanged = |needs_confirmation, replaced_label| Switched {
         switched: false,
@@ -162,6 +248,10 @@ pub fn switch(
     }
     let outcome = {
         let _op = state.ops.lock();
+        let _account_guard = crate::t3_bridge::lock().map_err(|e| UiError::new("io", e))?;
+        if expected_from.is_some_and(|from| app::in_use_name(pid).as_deref() != Some(from)) {
+            return Ok(unchanged(false, None));
+        }
         let engine = app::engine();
         let outcome = if replace_unmanaged {
             engine.switch(name, Some(pid))
@@ -255,8 +345,13 @@ pub async fn name_account(app: AppHandle, provider: String, name: String) -> Ans
     let pid = self::provider(&provider)?;
     blocking(move || {
         let state = app.state::<AppState>();
+        // Never named under the record alone: whose the token is decides.
+        if pid == ProviderId::ClaudeCode {
+            app::engine().check_live(&Http::brief());
+        }
         let enrolled = {
             let _op = state.ops.lock();
+            let _account_guard = crate::t3_bridge::lock().map_err(|e| UiError::new("io", e))?;
             app::engine().enroll(pid, &name)
         };
         app::log(
@@ -286,6 +381,7 @@ pub async fn rename_account(
         let state = app.state::<AppState>();
         let renamed = {
             let _op = state.ops.lock();
+            let _account_guard = crate::t3_bridge::lock().map_err(|e| UiError::new("io", e))?;
             app::engine().rename(&name, Some(pid), &new_name)
         };
         app::log(
@@ -300,8 +396,8 @@ pub async fn rename_account(
             // The usage read under the old name belongs to the new one, and so
             // do its warm-up setting and record.
             app::rename_usage(&app, pid, &name, &account.name);
-            if pid == ProviderId::ClaudeCode {
-                crate::warm::follow_rename(&app::host(), &name, &account.name);
+            if matches!(pid, ProviderId::ClaudeCode | ProviderId::Codex) {
+                crate::warm::follow_rename(&app::host(), pid, &name, &account.name);
             }
             crate::webwin::follow_rename(&app, pid, &name, account);
         }
@@ -320,6 +416,7 @@ pub async fn forget_account(app: AppHandle, provider: String, name: String) -> A
         let state = app.state::<AppState>();
         let (removed, was) = {
             let _op = state.ops.lock();
+            let _account_guard = crate::t3_bridge::lock().map_err(|e| UiError::new("io", e))?;
             let engine = app::engine();
             // As it was: its web profile is named by who it is on macOS.
             let was = engine.state().ok().and_then(|s| {
@@ -336,8 +433,8 @@ pub async fn forget_account(app: AppHandle, provider: String, name: String) -> A
                 .account(&name)
                 .outcome(&removed),
         );
-        if removed.is_ok() && pid == ProviderId::ClaudeCode {
-            crate::warm::follow_forget(&app::host(), &name);
+        if removed.is_ok() && matches!(pid, ProviderId::ClaudeCode | ProviderId::Codex) {
+            crate::warm::follow_forget(&app::host(), pid, &name);
         }
         if let (Ok(_), Some(was)) = (&removed, &was) {
             crate::webwin::follow_forget(&app, pid, was);
@@ -472,6 +569,7 @@ pub async fn quit(app: AppHandle) {
 pub async fn set_automation(
     app: AppHandle,
     auto_switch: Option<bool>,
+    auto_switch_codex: Option<bool>,
     auto_switch_at: Option<u8>,
     use_first: Option<crate::duty::UseFirst>,
     notify_run_out: Option<bool>,
@@ -484,6 +582,9 @@ pub async fn set_automation(
         let mut saved = settings::load(&host);
         if let Some(on) = auto_switch {
             saved.auto_switch = on;
+        }
+        if let Some(on) = auto_switch_codex {
+            saved.auto_switch_codex = on;
         }
         if let Some(at) = auto_switch_at {
             saved.auto_switch_at = at.clamp(50, 100);
@@ -512,15 +613,35 @@ pub async fn set_automation(
     .await
 }
 
-/// Turn warm-ups on or off for one Claude Code account.
+/// Turn warm-ups on or off for one account.
 #[tauri::command]
-pub async fn set_warm_up(app: AppHandle, name: String, on: bool) -> Answer<()> {
+pub async fn set_warm_up(app: AppHandle, provider: String, name: String, on: bool) -> Answer<()> {
+    let pid = self::provider(&provider)?;
+    if !matches!(pid, ProviderId::ClaudeCode | ProviderId::Codex) {
+        return Err(UiError::new(
+            "invalidData",
+            "Warm-up is unsupported for this tool",
+        ));
+    }
     blocking(move || {
         let host = app::host();
         let mut saved = settings::load(&host);
-        saved.warm_up.retain(|n| n != &name);
+        if !app::engine()
+            .state()
+            .map_err(|e| UiError::from(&e))?
+            .accounts
+            .iter()
+            .any(|a| a.provider == pid && a.name == name)
+        {
+            return Err(UiError::new(
+                "unknownAccount",
+                "Account is no longer enrolled",
+            ));
+        }
+        let accounts = saved.warm_accounts_mut(pid);
+        accounts.retain(|n| n != &name);
         if on {
-            saved.warm_up.push(name);
+            accounts.push(name);
         }
         settings::save(&host, &saved).map_err(|e| UiError::from(&e))?;
         app::refresh(&app);

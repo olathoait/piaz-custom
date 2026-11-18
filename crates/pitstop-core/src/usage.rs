@@ -21,6 +21,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 pub const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+pub const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 pub const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 pub const CURSOR_USAGE_URL: &str =
     "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage";
@@ -64,10 +65,15 @@ pub enum UsageReport {
     /// The parked access token has lapsed; switching to the account lets
     /// Claude Code renew it.
     Expired,
-    /// Anthropic refused the token (revoked or signed out elsewhere).
+    /// Anthropic refused the token (revoked or signed out elsewhere), or the
+    /// login holds nothing that renews any more.
     Unauthorized,
     Failed(String),
 }
+
+/// Anthropic answers 429 to every OAuth call not sent as Claude Code.
+// shortcut: any `claude-code/<semver>` passes today; bump if Anthropic starts checking the version.
+const CLAUDE_USER_AGENT: &str = "claude-code/2.1.327";
 
 /// What a read the service turned away for coming too often came to.
 pub const RATE_LIMITED: &str = "rate limited, try again later";
@@ -79,6 +85,8 @@ pub const NETWORK: &str = "network: ";
 /// How long one try at a read may take. Slow links take seconds just to
 /// shake hands, so this is generous.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// The same for a request someone is waiting on, such as a switch.
+const BRIEF_TIMEOUT: Duration = Duration::from_secs(5);
 /// The pause before the one retry of a read that got no answer.
 const RETRY_AFTER: Duration = Duration::from_secs(2);
 
@@ -92,6 +100,9 @@ pub enum FetchError {
 pub trait UsageApi: Sync {
     /// Anthropic's answer for a Claude Code access token.
     fn claude(&self, access_token: &str) -> Result<Value, FetchError>;
+    /// Whose a Claude Code access token is: the account and organization
+    /// Anthropic gave it to.
+    fn claude_profile(&self, access_token: &str) -> Result<Value, FetchError>;
     /// OpenAI's answer for a Codex access token and its ChatGPT account.
     fn codex(&self, access_token: &str, account_id: &str) -> Result<Value, FetchError>;
     /// Cursor's answer for its access token: this billing period's use,
@@ -110,8 +121,17 @@ pub struct Http {
 
 impl Http {
     pub fn new() -> Self {
+        Self::timing_out_after(READ_TIMEOUT)
+    }
+
+    /// For a request someone is waiting on: given up on sooner.
+    pub fn brief() -> Self {
+        Self::timing_out_after(BRIEF_TIMEOUT)
+    }
+
+    fn timing_out_after(timeout: Duration) -> Self {
         let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(READ_TIMEOUT))
+            .timeout_global(Some(timeout))
             .http_status_as_error(false)
             .build()
             .into();
@@ -158,6 +178,44 @@ fn call_twice(
     })
 }
 
+impl crate::limit_reset::ResetApi for Http {
+    fn profile(&self, token: &str) -> Result<Value, FetchError> {
+        self.claude_profile(token)
+    }
+
+    fn grants(&self, token: &str) -> Result<Value, FetchError> {
+        // shortcut: Claude Code 2.1.325's private reset API; recheck after API changes.
+        answer(
+            self.agent
+                .get(format!("{USAGE_URL}?cedar_ember=1&skip_spend=1"))
+                .header("Authorization", format!("Bearer {token}"))
+                .header("anthropic-beta", "oauth-2025-04-20")
+                .header("User-Agent", CLAUDE_USER_AGENT)
+                .call(),
+            "Anthropic",
+        )
+    }
+
+    fn claim(
+        &self,
+        token: &str,
+        organization: &str,
+        grant: &str,
+        request: &str,
+    ) -> Result<Value, FetchError> {
+        answer(
+            self.agent
+                .post(format!("https://api.anthropic.com/api/organizations/{organization}/reset_rate_limits"))
+                .header("Authorization", format!("Bearer {token}"))
+                .header("anthropic-beta", "oauth-2025-04-20")
+                .header("User-Agent", CLAUDE_USER_AGENT)
+                .header("Content-Type", "application/json")
+                .send(serde_json::json!({"program":"cedar_ember", "grant_id":grant, "request_id":request}).to_string()),
+            "Anthropic",
+        )
+    }
+}
+
 impl UsageApi for Http {
     fn claude(&self, access_token: &str) -> Result<Value, FetchError> {
         let response = call_twice(|| {
@@ -165,6 +223,19 @@ impl UsageApi for Http {
                 .get(USAGE_URL)
                 .header("Authorization", format!("Bearer {access_token}"))
                 .header("anthropic-beta", "oauth-2025-04-20")
+                .header("User-Agent", CLAUDE_USER_AGENT)
+                .call()
+        });
+        answer(response, "Anthropic")
+    }
+
+    fn claude_profile(&self, access_token: &str) -> Result<Value, FetchError> {
+        let response = call_twice(|| {
+            self.agent
+                .get(PROFILE_URL)
+                .header("Authorization", format!("Bearer {access_token}"))
+                .header("anthropic-beta", "oauth-2025-04-20")
+                .header("User-Agent", CLAUDE_USER_AGENT)
                 .call()
         });
         answer(response, "Anthropic")
@@ -215,6 +286,7 @@ impl UsageApi for Http {
         let mut response = self
             .agent
             .post(CLAUDE_TOKEN_URL)
+            .header("User-Agent", CLAUDE_USER_AGENT)
             .header("Content-Type", "application/json")
             .send(body)
             .map_err(|e| FetchError::Other(format!("{NETWORK}{e}")))?;
@@ -249,25 +321,56 @@ fn renewal_refused(status: u16, said: Option<&Value>) -> FetchError {
 pub(crate) enum Token {
     Valid(String),
     Expired,
+    /// Nothing in it works or renews: only signing in again mends it.
+    SignedOut,
     Missing,
 }
 
+/// `claudeAiOauth` of a claude-code blob.
+fn claude_oauth(blob: &[u8]) -> Option<Value> {
+    let blob = serde_json::from_slice::<Value>(blob).ok()?;
+    let credentials = serde_json::from_str::<Value>(blob.get("credentials")?.as_str()?).ok()?;
+    credentials.get("claudeAiOauth").cloned()
+}
+
+/// The access token of a claude-code blob, lapsed or not.
+pub(crate) fn claude_access_token(blob: &[u8]) -> Option<String> {
+    claude_oauth(blob)?
+        .get("accessToken")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 /// Pull `claudeAiOauth.accessToken` out of a claude-code blob, unless its
-/// `expiresAt` (epoch ms) is already past.
+/// `expiresAt` (epoch ms) is already past. A login is signed out when its
+/// tokens are blank, as Claude Code leaves them once a renewal is refused, or
+/// when it lapsed with a refresh token that is blank or past
+/// `refreshTokenExpiresAt`: switching to it would leave Claude Code signed out.
 pub(crate) fn claude_token(blob: &[u8], now_secs: i64) -> Token {
-    let credentials = serde_json::from_slice::<Value>(blob)
-        .ok()
-        .and_then(|b| b.get("credentials")?.as_str().map(str::to_owned))
-        .and_then(|c| serde_json::from_str::<Value>(&c).ok());
-    let Some(oauth) = credentials.as_ref().and_then(|c| c.get("claudeAiOauth")) else {
+    let Some(oauth) = claude_oauth(blob) else {
         return Token::Missing;
     };
     let Some(token) = oauth.get("accessToken").and_then(Value::as_str) else {
         return Token::Missing;
     };
-    match oauth.get("expiresAt").and_then(Value::as_i64) {
-        Some(expires_ms) if expires_ms / 1000 <= now_secs => Token::Expired,
-        _ => Token::Valid(token.to_owned()),
+    if token.is_empty() {
+        return Token::SignedOut;
+    }
+    let past = |key: &str| {
+        oauth
+            .get(key)
+            .and_then(Value::as_i64)
+            .is_some_and(|ms| ms / 1000 <= now_secs)
+    };
+    if !past("expiresAt") {
+        return Token::Valid(token.to_owned());
+    }
+    // A login with no refresh token at all is left for Claude Code to judge.
+    let refresh_blank = oauth.get("refreshToken").and_then(Value::as_str) == Some("");
+    if refresh_blank || past("refreshTokenExpiresAt") {
+        Token::SignedOut
+    } else {
+        Token::Expired
     }
 }
 
@@ -278,13 +381,6 @@ pub struct ClaudeRenewal {
     /// Space-separated, as the request sends them.
     pub scopes: String,
     pub client_id: String,
-}
-
-/// The `claudeAiOauth` inside a claude-code vault blob.
-fn claude_oauth(blob: &[u8]) -> Option<Value> {
-    let blob = serde_json::from_slice::<Value>(blob).ok()?;
-    let credentials = serde_json::from_str::<Value>(blob.get("credentials")?.as_str()?).ok()?;
-    credentials.get("claudeAiOauth").cloned()
 }
 
 /// The refresh token of a claude-code blob: two logins holding the same one
@@ -361,6 +457,22 @@ pub(crate) fn claude_renewed(blob: &[u8], answer: &Value, now_secs: i64) -> Opti
     blob.as_object_mut()?
         .insert("credentials".into(), credentials.to_string().into());
     serde_json::to_vec(&blob).ok()
+}
+
+/// Whose Anthropic's profile answer says a token is: the identity accounts
+/// are recorded by (`<account>:<organization>`, as `oauthAccount` gives
+/// them) and the email.
+pub(crate) fn profile_owner(profile: &Value) -> Option<(String, Option<String>)> {
+    let account = profile.pointer("/account/uuid")?.as_str()?;
+    let organization = profile
+        .pointer("/organization/uuid")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let email = profile
+        .pointer("/account/email")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Some((format!("{account}:{organization}"), email))
 }
 
 /// The access token and ChatGPT account id inside a codex vault blob, which
@@ -1063,6 +1175,21 @@ mod tests {
         );
     }
 
+    /// Anthropic's profile answer, trimmed (2026-10).
+    #[test]
+    fn a_profile_names_the_account_and_organization_a_token_is_for() {
+        let profile = json!({
+            "account": {"uuid": "acc-1", "email": "c@x.com", "display_name": "C"},
+            "organization": {"uuid": "org-1", "name": "Team", "organization_type": "claude_team"},
+            "application": {"name": "Claude Code"}
+        });
+        assert_eq!(
+            profile_owner(&profile),
+            Some(("acc-1:org-1".into(), Some("c@x.com".into())))
+        );
+        assert_eq!(profile_owner(&json!({"error": "nope"})), None);
+    }
+
     #[test]
     fn rfc3339_parses_offsets_and_fractions() {
         assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), Some(0));
@@ -1235,5 +1362,41 @@ mod tests {
             renewal_refused(400, Some(&json!({"error": "invalid_scope"}))),
             FetchError::Other(why) if why == "Anthropic answered 400 (invalid_scope)"
         ));
+    }
+
+    #[test]
+    fn a_login_that_nothing_renews_is_signed_out_not_expired() {
+        let now = 1_800_000_000;
+        let (lapsed, later) = ((now - 1) * 1000, (now + 60) * 1000);
+        // what Claude Code left after a renewal was refused
+        let blanked = json!({"accessToken": "", "refreshToken": "", "expiresAt": 0,
+            "refreshTokenExpiresAt": later});
+        assert!(matches!(
+            claude_token(&login(blanked), now),
+            Token::SignedOut
+        ));
+        let no_refresh = json!({"accessToken": "AT", "refreshToken": "", "expiresAt": lapsed});
+        assert!(matches!(
+            claude_token(&login(no_refresh), now),
+            Token::SignedOut
+        ));
+        let refresh_lapsed = json!({"accessToken": "AT", "refreshToken": "R",
+            "expiresAt": lapsed, "refreshTokenExpiresAt": lapsed});
+        assert!(matches!(
+            claude_token(&login(refresh_lapsed), now),
+            Token::SignedOut
+        ));
+
+        // a refresh token still good is renewed by Claude Code on a switch
+        let renewable = json!({"accessToken": "AT", "refreshToken": "R",
+            "expiresAt": lapsed, "refreshTokenExpiresAt": later});
+        assert!(matches!(
+            claude_token(&login(renewable), now),
+            Token::Expired
+        ));
+        // and a live access token reads whatever its refresh token says
+        let live = json!({"accessToken": "AT", "refreshToken": "R",
+            "expiresAt": later, "refreshTokenExpiresAt": lapsed});
+        assert!(matches!(claude_token(&login(live), now), Token::Valid(t) if t == "AT"));
     }
 }

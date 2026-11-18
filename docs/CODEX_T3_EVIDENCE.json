@@ -1,0 +1,101 @@
+{
+  "verifiedAt": "2026-11-04T19:20:55.600621+00:00",
+  "appVersion": "0.6.0+codex.2",
+  "installedSha256": "07804522e193d959e4379654dde40af76dbed280156da780bdd15891487b369e",
+  "t3Version": "0.1.7",
+  "codexVersion": "0.166.0-alpha.5.1",
+  "quotaFault": "Injected structured usageLimitExceeded after a real native turn finished tool work. No deliberate exhaustion.",
+  "runs": [
+    {
+      "runOrdinal": 1,
+      "status": "completed",
+      "nativeStatuses": [
+        "failed",
+        "completed"
+      ],
+      "oneProviderThread": true,
+      "uniqueNativeTurnIds": true
+    },
+    {
+      "runOrdinal": 2,
+      "status": "completed",
+      "nativeStatuses": [
+        "failed",
+        "completed"
+      ],
+      "oneProviderThread": true,
+      "uniqueNativeTurnIds": true
+    },
+    {
+      "runOrdinal": 3,
+      "status": "completed",
+      "nativeStatuses": [
+        "completed"
+      ],
+      "oneProviderThread": true,
+      "uniqueNativeTurnIds": true
+    }
+  ],
+  "proofFileLineCounts": {
+    "proof.log": 1,
+    "proof-v2.log": 1
+  },
+  "encryptedSandboxBridgeSwitches": 2,
+  "watchedSettingsReload": "ready; existing conversation resumed and completed",
+  "checks": {
+    "rustPassed": 374,
+    "rustIgnored": 3,
+    "nodePassed": 17,
+    "activationTestsPassed": 1,
+    "clippyWarningsDenied": "pass",
+    "signature": "pass",
+    "nodeBreakdown": {
+      "proxy": 16,
+      "installedNativeWithSyntheticCredentials": 1
+    }
+  },
+  "liveBridgeActivation": "active: actual T3 child proxy handled the resumed implementation turn and matches the current Piaz account",
+  "liveActivationStatusPath": "/Users/thoabd/.local/share/piaz-switch/bridge/activation-status.json",
+  "limits": [
+    "End-to-end quota failure is injected, not natural.",
+    "Long-lived token refresh and native subagent recovery not proven.",
+    "Continuation adapter validated with T3 0.1.7 only."
+  ],
+  "liveVerifiedAt": "2026-11-04T20:01:24.992238+00:00",
+  "runtimeMigration": {
+    "userAuthorizedImmediate": true,
+    "reason": "Previous shared native process survived settings reload; ready provider cache was insufficient evidence.",
+    "retiredLegacyPids": [
+      89624
+    ],
+    "t3ServerPid": 88738,
+    "proxyPid": 27103,
+    "nativePid": 27104,
+    "bridgeRevision": 2,
+    "actualProcessChainVerified": true,
+    "handledRealT3Turn": true,
+    "currentPiazAccountMatches": true,
+    "resumedConversations": 1,
+    "otherInitiallyActiveConversation": "Completed before the immediate migration; no duplicate continuation sent.",
+    "otherConversationCompletedAt": [
+      "2026-11-04T19:58:04.958Z"
+    ],
+    "installedBridgeSha256": {
+      "codex-proxy.mjs": "5fdcc7a4be556b872b7d616327bc439dbecce3da283d8bb40d15b1e29d2cdf92",
+      "activate-when-idle.py": "3b9eed8cf97522557307497d2a8daab63807953be0d254bc6cba83b05dfc7b7d"
+    }
+  },
+  "manualSwitchNativeProof": {
+    "credentials": "synthetic; no real account credentials",
+    "provider": "loopback WebSocket mock",
+    "nativeBinary": "installed Codex 0.166.0-alpha.5.1",
+    "steps": [
+      "Start a turn as A and hold the model response.",
+      "Write B to the private auth file; the watcher applies B in the same native process.",
+      "Codex revokes the active network context; bridge maps the affected terminal failure to T3 continuation.",
+      "The next turn in the same conversation sends a WebSocket inference request authenticated as B."
+    ],
+    "nativeProcessRetained": true,
+    "subscriptionQuotaUsed": false
+  }
+}

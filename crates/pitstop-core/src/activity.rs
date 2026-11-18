@@ -66,6 +66,7 @@ pub mod verb {
     /// A parked login renewed before it was read.
     pub const RENEW: &str = "renew";
     pub const WARM_UP: &str = "warm-up";
+    pub const LIMIT_RESET: &str = "limit-reset";
 }
 
 impl Entry {

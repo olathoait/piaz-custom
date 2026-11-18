@@ -14,6 +14,37 @@ use crate::model::{AccountView, Suggestion, ToolView, UsageView, WindowView};
 /// How long a reading that worked stands in for reads that failed.
 pub const KEEP_GOOD_FOR: i64 = 15 * 60;
 
+/// Automation cannot use quota kept from a failed read or from before a rename.
+pub fn fresh_codex_tool(
+    tool: &ToolView,
+    read_at: i64,
+    names: &HashSet<String>,
+    now: i64,
+) -> Option<ToolView> {
+    if read_at <= 0 || !(0..=120).contains(&(now - read_at)) {
+        return None;
+    }
+    Some(ToolView {
+        accounts: tool
+            .accounts
+            .iter()
+            .filter(|a| names.contains(&a.name))
+            .filter(|a| match &a.usage {
+                Some(UsageView::Ok { windows }) => {
+                    !windows.is_empty()
+                        && windows
+                            .iter()
+                            .all(|w| w.percent.is_finite() && w.percent >= 0.0)
+                }
+                Some(UsageView::Expired | UsageView::Unauthorized) => true,
+                _ => false,
+            })
+            .cloned()
+            .collect(),
+        ..tool.clone()
+    })
+}
+
 /// When a read asked for at `now` may start: now, or once `READ_SOONEST`
 /// has passed since the last one started at `tried_at`.
 pub fn read_start(tried_at: Option<i64>, now: i64) -> i64 {
@@ -174,19 +205,19 @@ pub fn warm_retry_after(warmed: &Warmed) -> i64 {
 /// Automatic switches tried for one limit of one account before its reset.
 pub const SWITCH_TRIES: u32 = 3;
 /// How often usage is read when no reset is near.
-pub const READ_EVERY: i64 = 5 * 60;
+pub const READ_EVERY: i64 = 60 * 60;
 /// The soonest one read follows another.
-pub const READ_SOONEST: i64 = 30;
+pub const READ_SOONEST: i64 = 2 * 60;
 /// How long after a reset its fresh reading is asked for.
 const AFTER_RESET: i64 = 30;
 
 /// Seconds until the next read when every read failed for want of a network:
-/// sooner than the usual five minutes, so usage shows soon after it is back.
-pub const READ_OFFLINE: i64 = 60;
+/// sooner than the usual hour, so usage shows soon after it is back.
+pub const READ_OFFLINE: i64 = 5 * 60;
 
 /// Seconds until the next usage read: shortly after the nearest reset still
 /// to come, so a limit that starts afresh shows it within a minute, and
-/// otherwise every five minutes.
+/// otherwise every hour.
 pub fn next_read_after(resets: impl Iterator<Item = i64>, now: i64) -> i64 {
     resets
         .filter(|&at| at > now)
@@ -1090,6 +1121,95 @@ mod tests {
             },
             accounts,
         }
+    }
+
+    #[test]
+    fn codex_threshold_switch_parks_the_latest_login_and_loads_the_target() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use pitstop_core::engine::vault_id;
+        use pitstop_core::{provider::provider_for, testing::FakeHost, vault, Engine, ProviderId};
+        let host = FakeHost::new();
+        let engine = Engine::new(host);
+        let provider = provider_for(ProviderId::Codex);
+        let blob = |user: &str, access: &str| {
+            serde_json::to_vec(&serde_json::json!({"tokens": {
+            "id_token": format!("header.{}.sig", URL_SAFE_NO_PAD.encode(serde_json::json!({"sub":user}).to_string())),
+            "account_id": "personal", "access_token": access, "refresh_token": "refresh",
+        }})).unwrap()
+        };
+        let first = blob("one", "first");
+        let second = blob("two", "second");
+        provider.write_active(engine.host(), &first).unwrap();
+        engine.enroll(ProviderId::Codex, "active").unwrap();
+        provider.write_active(engine.host(), &second).unwrap();
+        engine.enroll(ProviderId::Codex, "ready").unwrap();
+        engine.switch("active", Some(ProviderId::Codex)).unwrap();
+        let refreshed = blob("one", "refreshed");
+        provider.write_active(engine.host(), &refreshed).unwrap();
+        let tool = ToolView {
+            id: "codex",
+            name: "Codex",
+            ..claude(vec![
+                account("active", true, ok(vec![window("5h", 100.0, Some(900))])),
+                account("ready", false, ok(vec![window("5h", 0.0, None)])),
+            ])
+        };
+        let plan = switch_target(&tool, 95, UseFirst::MostLeft, NOW).unwrap();
+        engine
+            .switch_keeping_unmanaged(&plan.to, Some(ProviderId::Codex))
+            .unwrap();
+        assert!(provider.read_active(engine.host()).unwrap().unwrap().blob == second);
+        assert!(
+            vault::load(engine.host(), &vault_id(ProviderId::Codex, "active")).unwrap()
+                == refreshed
+        );
+    }
+
+    #[test]
+    fn codex_switch_uses_only_fresh_accounts_with_room_in_every_window() {
+        let tool = ToolView {
+            id: "codex",
+            name: "Codex",
+            ..claude(vec![
+                account(
+                    "active",
+                    true,
+                    ok(vec![
+                        window("5h", 96.0, Some(900)),
+                        window("week", 50.0, Some(2000)),
+                    ]),
+                ),
+                account(
+                    "weekly-full",
+                    false,
+                    ok(vec![
+                        window("5h", 0.0, None),
+                        window("week", 100.0, Some(2000)),
+                    ]),
+                ),
+                account("stale", false, ok(vec![window("5h", 0.0, None)])),
+                account(
+                    "ready",
+                    false,
+                    ok(vec![
+                        window("5h", 20.0, Some(900)),
+                        window("week", 40.0, Some(2000)),
+                    ]),
+                ),
+            ])
+        };
+        let fresh: HashSet<String> = ["active", "weekly-full", "ready"].map(str::to_owned).into();
+        assert!(fresh_codex_tool(&tool, NOW - 121, &fresh, NOW).is_none());
+        assert!(fresh_codex_tool(&tool, NOW + 1, &fresh, NOW).is_none());
+        let tool = fresh_codex_tool(&tool, NOW, &fresh, NOW).unwrap();
+        let plan = switch_target(&tool, 95, UseFirst::MostLeft, NOW).unwrap();
+        assert_eq!(plan.to, "ready");
+        assert_eq!(plan.from, "active");
+        let held = [limit_key("codex", "active", "5h", Some(NOW + 900))].into();
+        assert!(switch_target_holding(&tool, 95, UseFirst::MostLeft, &held, NOW).is_none());
+        let mut tool = tool;
+        tool.accounts.retain(|a| a.name != "ready");
+        assert!(switch_target(&tool, 95, UseFirst::MostLeft, NOW).is_none());
     }
 
     // ---- span
@@ -2136,11 +2256,11 @@ mod tests {
         );
         assert_eq!(next_read_after([NOW - 10].into_iter(), NOW), READ_EVERY);
         assert_eq!(next_read_after(std::iter::empty(), NOW), READ_EVERY);
-        assert_eq!(next_read_after([NOW + 2].into_iter(), NOW), 32);
+        assert_eq!(next_read_after([NOW + 2].into_iter(), NOW), READ_SOONEST);
         assert_eq!(
             next_read_after([NOW - 5, NOW + 1].into_iter(), NOW),
             READ_SOONEST.max(31)
         );
-        assert_eq!(next_read_after([NOW + 1000].into_iter(), NOW), READ_EVERY);
+        assert_eq!(next_read_after([NOW + 5000].into_iter(), NOW), READ_EVERY);
     }
 }

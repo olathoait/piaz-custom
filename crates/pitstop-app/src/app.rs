@@ -87,6 +87,7 @@ struct Inner {
     snapshot: Option<Snapshot>,
     warm: Vec<WarmState>,
     renewals: renew::Failures,
+    codex_read: (i64, HashSet<String>),
 }
 
 /// Where Pitstop keeps its state: the home directory, or `PITSTOP_HOME` to
@@ -357,19 +358,31 @@ fn start_read(app: &AppHandle) {
         refresh(&app);
         // However the read ends, the next one may start.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| renew_parked(&app)));
+        let codex_read_at = now();
         let read_now = std::panic::catch_unwind(|| engine().usage(&Http::new()));
         if let Ok(Ok(read)) = &read_now {
             // Recording a plan the read names is a change like any other.
             let state = app.state::<AppState>();
             let _op = state.ops.lock();
-            engine().record_plans(read);
+            if let Ok(_held) = crate::t3_bridge::lock() {
+                engine().record_plans(read);
+            }
         }
         let plan = {
             let state = app.state::<AppState>();
             let Ok(mut inner) = state.inner.lock() else {
                 return;
             };
+            inner.codex_read = (codex_read_at, HashSet::new());
             if let Ok(Ok(usage)) = read_now {
+                inner.codex_read.1 = usage
+                    .iter()
+                    .filter(|a| {
+                        a.provider == ProviderId::Codex
+                            && !matches!(a.report, pitstop_core::usage::UsageReport::Failed(_))
+                    })
+                    .map(|a| a.name.clone())
+                    .collect();
                 let usage = inner.renewals.mark_refused(usage);
                 let (usage, updated_at) =
                     duty::merge_read(&inner.usage, inner.updated_at, usage, now());
@@ -433,12 +446,11 @@ fn end_round(app: &AppHandle, finished: bool) {
 /// Whether `name`'s login is lent to a warm-up right now: a switch to it
 /// would put in use a login being renewed.
 pub fn warming(app: &AppHandle, provider: ProviderId, name: &str) -> bool {
-    provider == ProviderId::ClaudeCode
+    matches!(provider, ProviderId::ClaudeCode | ProviderId::Codex)
         && app.state::<AppState>().inner.lock().is_ok_and(|inner| {
-            inner
-                .warm
-                .iter()
-                .any(|w| w.name == name && w.standing == WarmStanding::Warming)
+            inner.warm.iter().any(|w| {
+                w.provider == provider && w.name == name && w.standing == WarmStanding::Warming
+            })
         })
 }
 
@@ -481,12 +493,60 @@ fn duties(app: &AppHandle) {
             .or_else(|| early_plan(app, &host, &snapshot, &settings, tool))
         });
         if let Some(plan) = plan {
-            auto_switch(app, &host, lang, &plan);
+            auto_switch(app, &host, lang, ProviderId::ClaudeCode, &plan);
+        }
+    }
+    let codex = snapshot
+        .tools
+        .iter()
+        .find(|t| t.id == ProviderId::Codex.as_str());
+    if let Some(tool) = codex {
+        let fresh = {
+            let state = app.state::<AppState>();
+            state
+                .inner
+                .lock()
+                .ok()
+                .map(|inner| inner.codex_read.clone())
+        };
+        if let Some(tool) =
+            fresh.and_then(|(at, names)| duty::fresh_codex_tool(tool, at, &names, now()))
+        {
+            if settings.auto_switch_codex {
+                let (held, quiet) = {
+                    let state = app.state::<AppState>();
+                    let mut auto = state.automatic.lock().unwrap_or_else(|e| e.into_inner());
+                    let held = auto
+                        .notified(&host, now())
+                        .keys()
+                        .iter()
+                        .filter_map(|k| k.strip_prefix(duty::HELD).map(str::to_owned))
+                        .collect();
+                    let quiet = auto
+                        .switches
+                        .iter()
+                        .rev()
+                        .any(|e| e.provider.as_deref() == Some("codex") && now() - e.at < 60);
+                    (held, quiet)
+                };
+                if !quiet {
+                    if let Some(plan) = duty::switch_target_holding(
+                        &tool,
+                        settings.auto_switch_at,
+                        settings.use_first,
+                        &held,
+                        now(),
+                    ) {
+                        auto_switch(app, &host, lang, ProviderId::Codex, &plan);
+                    }
+                }
+            }
+            warm_ups(app, &host, &settings, ProviderId::Codex, &tool);
         }
     }
     notices(app, &host, &snapshot, &settings, lang, claude);
     if let Some(tool) = claude {
-        warm_ups(app, &host, &settings, tool);
+        warm_ups(app, &host, &settings, ProviderId::ClaudeCode, tool);
     }
 }
 
@@ -735,8 +795,17 @@ fn switch_detail(plan: &duty::SwitchPlan) -> String {
     }
 }
 
-fn auto_switch(app: &AppHandle, host: &RealHost, lang: Lang, plan: &duty::SwitchPlan) {
-    let key = plan.key(ProviderId::ClaudeCode.as_str());
+fn auto_switch(
+    app: &AppHandle,
+    host: &RealHost,
+    lang: Lang,
+    provider: ProviderId,
+    plan: &duty::SwitchPlan,
+) {
+    if in_use_name(provider).as_deref() != Some(&plan.from) {
+        return;
+    }
+    let key = plan.key(provider.as_str());
     let state = app.state::<AppState>();
     {
         let Ok(mut auto) = state.automatic.lock() else {
@@ -748,13 +817,14 @@ fn auto_switch(app: &AppHandle, host: &RealHost, lang: Lang, plan: &duty::Switch
         }
         *tries += 1;
     }
-    let tool = ProviderId::ClaudeCode.display_name();
+    let tool = provider.display_name();
     let entry = Entry::new(now(), verb::AUTO_SWITCH, By::App)
-        .provider(ProviderId::ClaudeCode)
+        .provider(provider)
         .account(&plan.to)
         .from(Some(&plan.from))
         .detail(switch_detail(plan));
-    let switched = crate::commands::switch(app, ProviderId::ClaudeCode, &plan.to, false, false);
+    let switched =
+        crate::commands::switch_expected(app, provider, &plan.to, false, false, Some(&plan.from));
     match &switched {
         Ok(done) if done.switched => log(host, entry.clone()),
         Err(error) => log(host, entry.clone().result(error.code)),
@@ -780,7 +850,7 @@ fn auto_switch(app: &AppHandle, host: &RealHost, lang: Lang, plan: &duty::Switch
             };
             // Undoes this switch only while the account switched to is in use.
             let back = Act::SwitchBack {
-                provider: ProviderId::ClaudeCode,
+                provider,
                 from: plan.to.clone(),
                 to: plan.from.clone(),
             };
@@ -840,7 +910,11 @@ fn show_warm(app: &AppHandle, judged: WarmState) {
     {
         let state = app.state::<AppState>();
         if let Ok(mut inner) = state.inner.lock() {
-            match inner.warm.iter_mut().find(|w| w.name == judged.name) {
+            match inner
+                .warm
+                .iter_mut()
+                .find(|w| w.provider == judged.provider && w.name == judged.name)
+            {
                 Some(w) => *w = judged,
                 None => inner.warm.push(judged),
             }
@@ -853,6 +927,7 @@ fn warm_ups(
     app: &AppHandle,
     host: &RealHost,
     settings: &settings::Settings,
+    provider: ProviderId,
     tool: &model::ToolView,
 ) {
     let (today, minute) = local_day();
@@ -863,25 +938,30 @@ fn warm_ups(
     let mut judged = Vec::new();
     let mut started_any = false;
     for account in &tool.accounts {
-        if !settings.warm_up.contains(&account.name) {
+        if !settings.warm_accounts(provider).contains(&account.name) {
             continue;
         }
         // Asked again, not taken from the snapshot: an automatic switch this
         // round, or the user, may have changed the login in use since. The
         // live login decides, as in the window; the record only when the
         // login can't be read.
-        let in_use = match engine().live(ProviderId::ClaudeCode) {
+        let in_use = match engine().live(provider) {
             Ok(Live::Account(name)) => name == account.name,
             Ok(_) => false,
-            Err(_) => engine().state().is_ok_and(|s| {
-                s.active.get(ProviderId::ClaudeCode.as_str()) == Some(&account.name)
-            }),
+            Err(_) => engine()
+                .state()
+                .is_ok_and(|s| s.active.get(provider.as_str()) == Some(&account.name)),
         };
         let account = &model::AccountView {
             in_use,
             ..account.clone()
         };
-        let token = warm::token_for(host, &account.name, in_use);
+        let token = if provider == ProviderId::Codex {
+            crate::codex_warm::token_for(host, &account.name, in_use)
+        } else {
+            warm::token_for(host, &account.name, in_use)
+        };
+        let ledger_key = warm::key(provider, &account.name);
         let at = now();
         // The account in use lends its token as it is; a parked one lends its
         // whole login, which the warm-up renews when it can.
@@ -890,13 +970,13 @@ fn warm_ups(
             Some(t) if in_use => t.lapsed(at),
             Some(t) => t.lapsed(at) && !t.renewable,
         };
-        let warmed = ledger.get(&account.name).cloned().unwrap_or_default();
+        let warmed = ledger.get(&ledger_key).cloned().unwrap_or_default();
         let mut standing = duty::warm_standing(account, &warmed, expired, in_span, at);
         if standing == WarmStanding::Due {
             let (program, search) = tools.get_or_insert_with(|| {
                 let home = real_home();
                 (
-                    signin::find_program(ProviderId::ClaudeCode, &home),
+                    signin::find_program(provider, &home),
                     signin::search_path(&home),
                 )
             });
@@ -904,25 +984,39 @@ fn warm_ups(
                 show_warm(
                     app,
                     WarmState {
+                        provider,
                         name: account.name.clone(),
                         standing: WarmStanding::Warming,
                         warmed_at: warmed.started,
                     },
                 );
-                let outcome = if in_use {
+                let outcome = if provider == ProviderId::Codex {
+                    let state = app.state::<AppState>();
+                    let _op = state.ops.lock();
+                    match crate::t3_bridge::lock() {
+                        Err(error) => Some(Err(warm::Failure::Failed(error))),
+                        Ok(_held) => {
+                            let live = in_use_name(provider);
+                            ((live.as_deref() == Some(&account.name)) == in_use).then(|| {
+                                crate::codex_warm::run(host, &account.name, in_use, program, search)
+                            })
+                        }
+                    }
+                } else if in_use {
                     Some(warm::run(program, &token.access, search))
                 } else {
                     // No switch while the parked login is lent out: one to
                     // this account would put in use a login being renewed.
                     let state = app.state::<AppState>();
                     let _op = state.ops.lock();
-                    let still_parked = engine().state().is_ok_and(|s| {
-                        s.active.get(ProviderId::ClaudeCode.as_str()) != Some(&account.name)
-                    });
+                    let still_parked = engine()
+                        .state()
+                        .is_ok_and(|s| s.active.get(provider.as_str()) != Some(&account.name));
                     still_parked.then(|| warm::run_parked(host, &account.name, program, search))
                 };
                 let Some(outcome) = outcome else {
                     let unchanged = WarmState {
+                        provider,
                         name: account.name.clone(),
                         standing,
                         warmed_at: warmed.started,
@@ -936,7 +1030,7 @@ fn warm_ups(
                 log(
                     host,
                     Entry::new(now(), verb::WARM_UP, By::App)
-                        .provider(ProviderId::ClaudeCode)
+                        .provider(provider)
                         .account(&account.name)
                         .result(match &outcome {
                             Ok(()) => activity::DONE,
@@ -946,7 +1040,7 @@ fn warm_ups(
                 let name = account.name.clone();
                 let warmed = warm::update_if(
                     host,
-                    &account.name,
+                    &ledger_key,
                     &today,
                     now(),
                     outcome.as_ref().copied(),
@@ -955,15 +1049,16 @@ fn warm_ups(
                             state
                                 .accounts
                                 .iter()
-                                .any(|a| a.provider == ProviderId::ClaudeCode && a.name == name)
+                                .any(|a| a.provider == provider && a.name == name)
                         })
                     },
                 );
-                ledger.insert(account.name.clone(), warmed.clone());
+                ledger.insert(ledger_key.clone(), warmed.clone());
                 standing = duty::warm_standing(account, &warmed, expired, in_span, now());
                 show_warm(
                     app,
                     WarmState {
+                        provider,
                         name: account.name.clone(),
                         standing: standing.clone(),
                         warmed_at: warmed.started,
@@ -972,15 +1067,17 @@ fn warm_ups(
             }
         }
         judged.push(WarmState {
+            provider,
             name: account.name.clone(),
             standing,
-            warmed_at: ledger.get(&account.name).and_then(|w| w.started),
+            warmed_at: ledger.get(&ledger_key).and_then(|w| w.started),
         });
     }
     {
         let state = app.state::<AppState>();
         if let Ok(mut inner) = state.inner.lock() {
-            inner.warm = judged;
+            inner.warm.retain(|w| w.provider != provider);
+            inner.warm.extend(judged);
         };
     }
     refresh(app);
@@ -1071,7 +1168,7 @@ pub fn look_for_tools(app: &AppHandle, now: bool) -> bool {
 }
 
 /// Look for the tools once, read usage now, again shortly after each limit
-/// resets, and at least every five minutes.
+/// resets, and at least every hour.
 pub fn start_background(app: &AppHandle) {
     let handle = app.clone();
     std::thread::spawn(move || {

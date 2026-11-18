@@ -55,6 +55,7 @@ function updateGroup() {
   const v = update.view;
   if (!v) return null;
   const found = v.available;
+  const custom = v.current.includes("+codex.");
   let status;
   if (update.checking) status = t("updateChecking");
   else if (found) status = t("updateFound", { version: found.version });
@@ -66,7 +67,7 @@ function updateGroup() {
       ? t("updateCheckedAt", { time: clockTime(v.checkedAt) })
       : null;
   const action = found
-    ? keyed(button(v.canInstall ? t("updateButton") : t("updateDownload"), openUpdate, "primary compact"), "update")
+    ? keyed(button(custom ? t("updateViewRelease") : v.canInstall ? t("updateButton") : t("updateDownload"), openUpdate, "primary compact"), "update")
     : keyed(h("button", { class: "button compact", disabled: update.checking, onclick: checkForUpdate }, t("updateCheckNow")), "update-check");
   return h(
     "section",
@@ -78,7 +79,7 @@ function updateGroup() {
       h(
         "div",
         { class: "setting-row" },
-        h("div", null, h("div", { class: "setting-name", text: t("updateAuto") }), h("p", { class: "help", text: t("updateAutoHelp") })),
+        h("div", null, h("div", { class: "setting-name", text: t("updateAuto") }), h("p", { class: "help", text: t(custom ? "updateCustomHelp" : "updateAutoHelp") })),
         toggle(v.autoCheck, t("updateAuto"), () => invoke("set_check_updates", { on: !v.autoCheck }).catch((error) => openAlert(t("couldntChange"), errorText(error))), "update-auto"),
       ),
       h(
@@ -100,6 +101,7 @@ DIALOGS.update = function () {
   const d = dialog;
   const v = update.view;
   const found = v && v.available;
+  const custom = v && v.current.includes("+codex.");
   if (!found) {
     // Installed elsewhere, or withdrawn while the dialog was up.
     return [sheetHead(t("updateNone"), null), buttons(h("span", { class: "spacer" }), keyed(button(t("ok"), closeDialog, "primary"), "primary"))];
@@ -142,14 +144,14 @@ DIALOGS.update = function () {
     );
   }
   return [
-    sheetHead(t("updateTitle", { version: found.version }), t(v.canInstall ? "updateMessage" : "updatePortable", { current: v.current }), { tone: "accent", icon: "download" }),
+    sheetHead(t("updateTitle", { version: found.version }), t(custom ? "updateCustomHelp" : v.canInstall ? "updateMessage" : "updatePortable", { current: v.current }), { tone: "accent", icon: "download" }),
     found.notes ? h("div", { class: "update-notes", tabindex: "0", "aria-label": t("updateNotes") }, plainNotes(found.notes)) : null,
     progress,
     failureBox(t("updateFailed"), d.error),
     buttons(
       h("span", { class: "spacer" }),
       keyed(h("button", { class: "button", disabled: busy, onclick: closeDialog }, t("later")), "cancel"),
-      keyed(h("button", { class: "button primary", disabled: busy, onclick: run, "data-autofocus": true }, v.canInstall ? t("updateInstall") : t("updateDownload")), "primary"),
+      keyed(h("button", { class: "button primary", disabled: busy, onclick: run, "data-autofocus": true }, custom ? t("updateViewRelease") : v.canInstall ? t("updateInstall") : t("updateDownload")), "primary"),
     ),
   ];
 };

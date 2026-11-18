@@ -13,6 +13,8 @@ let snap = null;
 let pane = "accounts";
 let shownPane = null; // the pane the last render drew, to reset scrolling
 let selected = null; // "provider|name" of the selected row
+const resetCounts = new Map();
+let resetReadQueue = Promise.resolve();
 const switching = new Set(); // rows a switch is under way for
 let notices = []; // what this window was told: switches, additions
 let noticeSerial = 0;
@@ -559,7 +561,7 @@ function renderAccounts(moves) {
   for (const suggestion of snap.suggestions) callouts.push(suggestionNotice(suggestion));
   for (const notice of notices) callouts.push(noticeRow(notice));
   for (const tool of snap.tools) {
-    if (tool.live.state === "unmanaged") callouts.push(nameTip(tool));
+    if (tool.live.state === "unmanaged") callouts.push(tool.live.recorded ? misrecordedTip(tool) : nameTip(tool));
   }
   const keys = new Set(callouts.map((el) => el.dataset.callout));
   for (const el of callouts) {
@@ -615,6 +617,42 @@ function groupAdd(tool) {
   return keyed(add, `add:${tool.id}`);
 }
 
+// Serialize reset reads so a large account list starts only one request at a time.
+function resetCountBadge(tool, account) {
+  if (tool.id !== "codex" && tool.id !== "claude-code") return null;
+  const key = rowKey(tool.id, account.name);
+  let entry = resetCounts.get(key);
+  if (!entry || (!entry.loading && nowSecs() - entry.at >= 60)) {
+    entry = { loading: true };
+    resetCounts.set(key, entry);
+    resetReadQueue = resetReadQueue.then(async () => {
+      try {
+        const status = await invoke("get_limit_resets", { provider: tool.id, name: account.name });
+        if (tool.id === "claude-code") {
+          status.availableCount = status.eligible ? status.grants.reduce((total, grant) => {
+            if (!Number.isInteger(grant.resetsLeft) || grant.resetsLeft < 0) throw new Error("Invalid reset count");
+            return total + grant.resetsLeft;
+          }, 0) : 0;
+        }
+        if (!Number.isInteger(status.availableCount) || status.availableCount < 0) throw new Error("Missing reset count");
+        entry.count = status.availableCount;
+      } catch (_) {
+        entry.count = null;
+      } finally {
+        entry.loading = false;
+        entry.at = nowSecs();
+      }
+      render();
+    });
+  }
+  const label = entry.loading ? t("checkingResets") : entry.count == null ? t("resetCountUnknown") : t("resetCount", { n: entry.count });
+  return h("button", {
+    class: "button compact ghost",
+    title: t("limitResets"),
+    onclick: () => openLimitResets(tool, account),
+  }, label);
+}
+
 function accountRow(tool, account, moves) {
   const key = rowKey(tool.id, account.name);
   const usage = account.usage;
@@ -642,6 +680,7 @@ function accountRow(tool, account, moves) {
       { class: "identity" },
       h("div", { class: "row-title" }, h("span", { class: "row-name", text: account.name }), account.plan ? h("span", { class: "tag", text: account.plan }) : null),
       account.label && account.label !== account.name ? h("div", { class: "row-email" }, emailMask(key, account.label)) : null,
+      (tool.id === "codex" || tool.id === "claude-code") ? h("div", { class: "row-email" }, resetCountBadge(tool, account)) : null,
     ),
     h("div", { class: "row-side" }, sideOf(tool, account)),
     metersOf(tool, account, moves),
@@ -882,11 +921,11 @@ function meterLine(grid, moves, { id, label, used, pace, resets, resetsHelp, hel
   }
 }
 
-/** The warm-up row Settings shows for a Claude Code account, when it is on. */
+/** The warm-up row Settings shows for an account, when it is on. */
 function warmOf(tool, account) {
   const a = snap && snap.automation;
-  if (tool.id !== "claude-code" || !a) return null;
-  const row = a.warmUp.find((r) => r.name === account.name);
+  if (!a) return null;
+  const row = a.warmUp.find((r) => r.provider === tool.id && r.name === account.name);
   return row && row.on ? row : null;
 }
 
@@ -1013,6 +1052,19 @@ function nameTip(tool) {
   });
 }
 
+/** The tool holds another account's token while its own record still
+ * names the account below: nothing to name until it signs in again. */
+function misrecordedTip(tool) {
+  const { label, recorded } = tool.live;
+  return noticeRow({
+    key: `tip-misrecorded:${tool.id}:${label || ""}:${recorded}`,
+    kind: "warning",
+    icon: "warning",
+    title: t("misrecordedTitle", { tool: tool.name }),
+    lines: [t("misrecordedDetail", { tool: tool.name, email: label || t("misrecordedSomeone"), recorded })],
+  });
+}
+
 // ---------- rows: selection, keys, menu ----------
 
 function select(key) {
@@ -1060,6 +1112,7 @@ function openRowMenu(x, y, tool, account) {
   if (!account.inUse) items.push({ title: t("useName", { name: account.name }), run: () => useAccount(tool, account) });
   items.push({ title: t("signInAgain"), run: () => openSignInAgain(tool, account), disabled: tool.installed === false });
   items.push({ title: t("rename"), run: () => openRename(tool, account) });
+  if (["claude-code", "codex"].includes(tool.id)) items.push({ title: t("limitResets"), run: () => openLimitResets(tool, account) });
   const site = WEB_SITES[tool.id];
   if (site || account.label) items.push({ separator: true });
   if (site) items.push({ title: t("openSite", { site }), run: () => openWebWindow(tool, account) });
@@ -1077,6 +1130,37 @@ async function openWebWindow(tool, account) {
     if (opened === "browser") toast(t("siteInBrowser", { site: WEB_SITES[tool.id] }));
   } catch (error) {
     openAlert(t("couldntOpenSite", { site: WEB_SITES[tool.id] }), errorText(error));
+  }
+}
+
+async function openLimitResets(tool, account) {
+  const d = { type: "limitResets", provider: tool.id, tool: tool.name, name: account.name, loading: true, busy: false, error: null };
+  openDialog(d);
+  try {
+    d.status = await invoke("get_limit_resets", { provider: d.provider, name: d.name });
+  } catch (error) {
+    d.error = error;
+  } finally {
+    d.loading = false;
+    if (dialog === d) renderDialog();
+  }
+}
+
+async function useLimitReset(d) {
+  if (d.busy) return;
+  d.busy = true;
+  d.error = null;
+  renderDialog();
+  try {
+    await invoke("use_limit_reset", { provider: d.provider, name: d.name, identity: d.status.identity, grant: d.grant.id, request: d.request });
+    resetCounts.delete(rowKey(d.provider, d.name));
+    render();
+    closeDialog();
+    pushNotice({ id: "limit-reset", kind: "success", icon: "refresh", title: t("resetDone", { name: d.name }), lines: [t("resetDoneDetail", { tool: d.tool })] });
+  } catch (error) {
+    d.error = error;
+    d.busy = false;
+    renderDialog();
   }
 }
 
@@ -1681,6 +1765,43 @@ const DIALOGS = {
     ];
   },
 
+  limitResets() {
+    const d = dialog;
+    const grants = d.status?.eligible ? d.status.grants.filter((g) => g.resetsLeft > 0) : [];
+    const expires = (grant) => {
+      const date = new Date(grant.endsAt);
+      return grant.endsAt && Number.isFinite(date.getTime()) ? t("resetExpires", { date: date.toLocaleString(LANG === "vi" ? "vi-VN" : "en-GB") }) : "";
+    };
+    const details = (grant) => [t("resetsLeft", { n: grant.resetsLeft }), expires(grant)].filter(Boolean).join(" · ");
+    return [
+      sheetHead(t(d.grant ? "confirmLimitReset" : "limitResets"), t("resetAccount", { tool: d.tool, name: d.name })),
+      d.loading ? h("p", { class: "help", role: "status", text: t("checkingResets") }) : null,
+      d.status?.availableCount != null ? h("p", { class: "help", text: t("resetsLeft", { n: d.status.availableCount }) }) : null,
+      !d.loading && !d.error && !grants.length ? h("p", { class: "help", text: t("noResets") }) : null,
+      !d.grant ? grants.map((grant) => h("div", { class: "form" },
+        h("strong", { text: grant.label || grant.id || t("nextAvailableReset") }),
+        h("p", { class: "help", text: details(grant) }),
+        h("button", { class: "button", disabled: !grant.usableNow || grant.paused, onclick: () => {
+          d.grant = grant;
+          d.request = crypto.randomUUID();
+          renderDialog();
+        } }, t(grant.usableNow && !grant.paused ? "resetForFree" : "resetUnavailable")),
+      )) : [
+        h("p", { text: d.grant.label || d.grant.id || t("nextAvailableReset") }),
+        h("p", { class: "help", text: details(d.grant) }),
+        h("p", { class: "help", text: t("resetClears", { limits: d.grant.clears.map((key) => ({ five_hour: windowName("5h"), seven_day: windowName("week"), seven_day_opus: "Opus", seven_day_sonnet: "Sonnet" })[key] || key).join(", ") || t("resetOfferLimits") }) }),
+        h("p", { class: "help", text: t(d.provider === "codex" ? "codexResetWarning" : "resetWarning") }),
+      ],
+      failureBox(t("couldntReset"), d.error),
+      buttons(
+        h("span", { class: "spacer" }),
+        keyed(h("button", { class: "button", disabled: d.busy, onclick: closeDialog, "data-autofocus": true }, t("cancel")), "cancel"),
+        d.error && !d.grant ? keyed(button(t("tryAgain"), () => openLimitResets({ id: d.provider, name: d.tool }, { name: d.name })), "retry") : null,
+        d.grant ? keyed(h("button", { class: "button primary", disabled: d.busy, onclick: () => useLimitReset(d) }, t(d.busy ? "resettingLimits" : "resetForFree")), "primary") : null,
+      ),
+    ];
+  },
+
   confirm() {
     const d = dialog;
     const tool = toolOf(d.provider);
@@ -1701,7 +1822,8 @@ const DIALOGS = {
           }),
           "switch-anyway",
         ),
-        keyed(button(t("nameItFirst"), () => openName(d.provider), "primary"), "primary"),
+        // A login whose record names someone else can't be named.
+        tool && tool.live.recorded ? null : keyed(button(t("nameItFirst"), () => openName(d.provider), "primary"), "primary"),
       ),
     ];
   },
@@ -2142,7 +2264,7 @@ function automationGroups() {
     {
       "aria-label": t("shareAt"),
       // The share serves the automatic switch and the near-limit notices.
-      disabled: !a.autoSwitch && !a.notifyNear,
+      disabled: !a.autoSwitch && !a.autoSwitchCodex && !a.notifyNear,
       onchange: (event) => changeSetting({ autoSwitchAt: Number(event.target.value) }),
     },
     Array.from({ length: 11 }, (_, i) => 50 + i * 5).map((n) => h("option", { value: String(n), selected: n === a.autoSwitchAt }, `${n}%`)),
@@ -2174,7 +2296,13 @@ function automationGroups() {
       ),
       h(
         "div",
-        { class: "setting-row" + (a.autoSwitch || a.notifyNear ? "" : " muted") },
+        { class: "setting-row" },
+        h("div", null, h("div", { class: "setting-name", text: t("autoSwitchCodex") }), h("p", { class: "help", text: t("autoSwitchCodexHelp") })),
+        toggle(a.autoSwitchCodex, t("autoSwitchCodex"), () => changeSetting({ autoSwitchCodex: !a.autoSwitchCodex }), "auto-switch-codex"),
+      ),
+      h(
+        "div",
+        { class: "setting-row" + (a.autoSwitch || a.autoSwitchCodex || a.notifyNear ? "" : " muted") },
         h("div", { class: "setting-name", text: t("shareAt") }),
         h("span", { class: "select" }, keyed(threshold, "auto-switch-at")),
       ),
@@ -2211,10 +2339,10 @@ function automationGroups() {
           h(
             "div",
             { class: "warm-account" },
-            h("div", { class: "row-title" }, h("span", { class: "setting-name", text: row.name }), row.plan ? h("span", { class: "tag", text: row.plan }) : null),
+            h("div", { class: "row-title" }, h("span", { class: "setting-name", text: `${row.provider === "codex" ? "Codex" : "Claude Code"} · ${row.name}` }), row.plan ? h("span", { class: "tag", text: row.plan }) : null),
             h("p", { class: "help", text: warmText(row) }),
           ),
-          toggle(row.on, t("warmFor", { name: row.name }), () => invoke("set_warm_up", { name: row.name, on: !row.on }).catch((error) => openAlert(t("couldntChange"), errorText(error))), `warm:${row.name}`),
+          toggle(row.on, t("warmFor", { name: `${row.provider === "codex" ? "Codex" : "Claude Code"} ${row.name}` }), () => invoke("set_warm_up", { provider: row.provider, name: row.name, on: !row.on }).catch((error) => openAlert(t("couldntChange"), errorText(error))), `warm:${row.provider}:${row.name}`),
         ),
       )
     : [h("div", { class: "setting-row" }, h("p", { class: "help", text: t("warmNoAccounts") }))];
@@ -2443,6 +2571,7 @@ function changeText(entry) {
     forget: "logForget",
     renew: "logRenew",
     "warm-up": "logWarmUp",
+    "limit-reset": "logLimitReset",
   }[entry.verb];
   const params = { name: entry.account || "", from: entry.from || "" };
   return key ? t(key, params) : `${entry.verb} ${entry.account || ""}`.trim();
@@ -2469,7 +2598,7 @@ function resultText(code, verb) {
 
 function activityRow(entry) {
   const auto = entry.verb === "auto-switch";
-  const iconName = { use: "swap", "auto-switch": "swap", renew: "refresh", "warm-up": "flame", rename: "tag", forget: "trash" }[entry.verb] || "user";
+  const iconName = { use: "swap", "auto-switch": "swap", renew: "refresh", "warm-up": "flame", "limit-reset": "refresh", rename: "tag", forget: "trash" }[entry.verb] || "user";
   const bits = [];
   if (entry.provider) bits.push(toolName(entry.provider));
   if ((entry.verb === "use" || auto) && entry.from) bits.push(t("logFrom", { name: entry.from }));

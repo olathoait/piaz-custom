@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.6.1+codex.4 — local custom build
+
+- Check and redeem Claude's available usage limit resets from an account's menu,
+  with remaining counts, expiry dates, confirmation and an activity entry.
+- Add the same controls for earned Codex resets through the documented app-server
+  API, with authoritative counts, optional credit details and idempotent redemption.
+- Check active and parked Codex accounts in an isolated access-token-only server;
+  keep the global login and running T3 conversations intact.
+
+## 0.6.1+codex.3 — local custom build
+
+- Retain the upstream 0.6.1 Claude identity and renewal fixes with Codex automation.
+- Prevent the upstream updater from replacing this custom app and its T3 commands.
+
+## 0.6.0+codex.2 — local custom build
+
+- Add a private Piaz/Codex bridge to change authentication inside T3 and continue
+  root turns after terminal quota failures, retaining conversation and native IDs.
+- Coordinate Codex token renewal, warm-up and account changes across processes.
+- Install T3's executable proxy only after Codex work is idle; preserve a settings
+  backup and verify the watched provider reload. Adapter validated with T3 0.1.7.
+
+## 0.6.0+codex.1 — local custom build
+
+- Add opt-in Codex auto-switch using fresh quota, the existing threshold and account ordering.
+- Add isolated Codex warm-ups and provider-specific settings and ledger entries.
+- Existing Codex/T3 processes still need to reload authentication separately.
+
+## [0.6.1] - 2026-11-05
+
+### Fixed
+- Parked Claude Code logins no longer end up refused one after another ("sign in
+  again", "its parked login can't be renewed"). Claude Code keeps its token apart
+  from the record of whose it is (`oauthAccount` in `~/.claude.json`), and the Claude
+  desktop app's Claude Code sessions write the desktop app's own account into that
+  record, leaving the token alone. Piaz Switch went by the record: it took the
+  account the desktop app is signed in to as the one in use, read the real one's
+  limits under its name, renewed the real one's parked copy (refused: Claude Code
+  had already renewed that chain), and on a switch parked the token under the wrong
+  account, so the next renewal of either was refused too. Piaz Switch now asks
+  Anthropic whose the token is, once each time it changes, and goes by that answer
+  for the account in use, its limits, renewals, warm-ups and where a switch parks it.
+- A switch waits, saying why, when Anthropic can't be asked whose Claude Code's
+  token is (offline, or the token lapsed until Claude Code runs again) and its record
+  names another account than the one in use: going by the record alone could park
+  the token under the wrong account, or take the switch as made already. Renewals
+  of parked logins skip both accounts it could be meanwhile. A login Claude Code
+  signed itself out of is never parked over an account's saved one, nor in the way
+  of a switch.
+- A parked Claude Code login filed under the wrong account asks you to sign in again
+  instead of showing the other account's limits under its name. Each parked token is
+  asked whose it is too, once each time it changes; logins an older version parked
+  under the wrong account, as above, are found this way.
+- A parked Claude Code login that can no longer be renewed says **sign in again**,
+  with the button beside it, instead of "switching renews it". When Anthropic
+  refused a renewal, during a warm-up or in Claude Code, Claude Code blanked the
+  login's tokens, and Piaz Switch read what was left as a token that had only
+  lapsed: the warm-up said the login couldn't be renewed while the account's row
+  promised a switch would renew it, and a switch left Claude Code signed out. A
+  login whose refresh token is past the date it came with reads the same way.
+
 ## [0.6.0] - 2026-11-04
 
 ### Added

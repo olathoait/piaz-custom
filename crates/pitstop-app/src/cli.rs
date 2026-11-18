@@ -31,6 +31,9 @@ use crate::model::{Snapshot, ToolView, UiError, UsageView};
 /// any other start, which goes on to the app.
 pub fn headless(args: &[String]) -> Option<i32> {
     use std::io::Write;
+    if args.first().is_some_and(|a| a == "codex-bridge") {
+        return Some(crate::t3_bridge::headless());
+    }
     let line = match args.first().map(String::as_str) {
         Some(claude_settings::SUBCOMMAND) => statusline::run(&app::host()),
         Some(schedule::SUBCOMMAND) => renew_report(),
